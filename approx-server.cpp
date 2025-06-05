@@ -1,15 +1,94 @@
+#include <chrono>
 #include <iostream>
 #include <string>
-#include <climits>
+#include <map>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <vector>
+#include <cstring>
+#include <unistd.h>
 
+#include <poll.h>
+
+#define TIMEOUT 3
+
+enum class State { AwaitingHello, AwaitingPut, WaitingForState };
+
+
+struct client_info {
+    std::string username{};
+    // Czas połączenia z klientem.
+    std::chrono::steady_clock::time_point connect_time{};
+    int socket_fd{-1};
+    sockaddr_storage addr{};
+    std::string addr_text{}; // Wersja tekstowa do logów.
+    State state{State::AwaitingHello};
+    std::vector<double> coeffs;
+    std::vector<double> approx;
+    double penalty{0.0};
+    int puts_count{0};
+    std::string net_buffer;
+    int lowercase{0};
+};
+
+std::map<std::string, client_info> clients; // Mapa znanych nam klientów.
 int port = 0;
 int K = 100;
 int N = 4;
 int M = 131;
 std::string filename{};
 
+
 static void print_error(const std::string& msg) {
     std::cerr << "ERROR: " << msg << "\n";
+}
+
+// Funkcja do tworzenia kluczy do mapy klientów.
+static std::string peer_key(const sockaddr_storage &addr) {
+    char buf[INET6_ADDRSTRLEN];
+    uint16_t port = 0;
+    if (addr.ss_family == AF_INET) {
+        const sockaddr_in *a = reinterpret_cast<const sockaddr_in*>(&addr);
+        inet_ntop(AF_INET, &a->sin_addr, buf, sizeof(buf));
+        port = ntohs(a->sin_port);
+    } else {
+        const sockaddr_in6 *a6 = reinterpret_cast<const sockaddr_in6*>(&addr);
+        inet_ntop(AF_INET6, &a6->sin6_addr, buf, sizeof(buf));
+        port = ntohs(a6->sin6_port);
+    }
+    return std::string(buf) + ":" + std::to_string(port);
+}
+
+static bool handle_hello(std::string key) {
+    if (clients.find(key) == clients.end()) {
+        print_error("Unknown client");
+        return false;
+    }
+    if (clients[key].state != State::AwaitingHello) {
+        print_error("Client already sent HELLO");
+        return false;
+    }
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    if (t - clients[key].connect_time > std::chrono::seconds(TIMEOUT)) {
+        clients.erase(key);
+        return true;
+    }
+    int lowercase = 0;
+    std::string player_id{};
+    if (player_id.empty()) return false;
+    for (char c : player_id) {
+        if (!(std::isdigit(c) ||
+            (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+            return false;
+        } else if (c >= 'a' && c <= 'z') {
+            lowercase++;
+        }
+    }
+
+    clients[key].lowercase = lowercase;
+    clients[key].state = State::AwaitingPut;
+    clients[key].username = player_id;
+    return true;
 }
 
 static bool parse_arguments(int argc, char *argv[]) {
@@ -64,8 +143,11 @@ static bool parse_arguments(int argc, char *argv[]) {
     return true;
 }
 
-int main(int argc, char* argv[]) {
 
+
+
+
+int main(int argc, char* argv[]) {
     if (!parse_arguments(argc, argv)) {
         return 1;
     }
