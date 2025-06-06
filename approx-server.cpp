@@ -38,6 +38,8 @@ struct client_info {
     std::string pending_response{};    // treść odpowiedzi, którą musimy wysłać
     std::chrono::steady_clock::time_point send_time{}; // kiedy wysłać pending_response
     bool has_pending{false};         // czy jest odpowiedź do wysłania
+    client_info() = default;
+
 };
 
 std::map<int, client_info> clients; // Mapa znanych nam klientów.
@@ -238,47 +240,57 @@ int create_and_bind_socket(const char* port_str, int family) {
     return listen_fd;
 }
 
-
-
-
-int main(int argc, char* argv[]) {
-    if (!parse_arguments(argc, argv)) {
-        return 1;
+void process_client_buffer(int fd) {
+    std::string& net_buffer = clients[fd].net_buffer;
+    if (net_buffer.size() > 7 && net_buffer.substr(0, 6) == "HELLO ") {
+        size_t pos = net_buffer.find("\r\n");
+        if (pos != std::string::npos) {
+            std::string msg = net_buffer.substr(0, pos);
+            if (!handle_hello(fd, msg)) {
+                print_error("Invalid HELLO message\n");
+            }
+            net_buffer.erase(0, pos + 2);
+        }
     }
+}
+
+bool initialize(int argc, char* argv[]) {
+    if (!parse_arguments(argc, argv)) return false;
 
     coeff_file.open(filename);
     if (!coeff_file) {
         std::cerr << "ERROR: Nie udało się otworzyć pliku: " << filename << "\n";
-        return 1;
+        return false;
     }
 
+    return true;
+}
+
+int create_server_socket(int family) {
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
+    return create_and_bind_socket(port_str, family);
+}
 
-    int listen_fd6 = create_and_bind_socket(port_str, AF_INET6);
-    int listen_fd4 = create_and_bind_socket(port_str, AF_INET);
+void display_assigned_port(int listen_fd6, int listen_fd4) {
+    if (port != 0) return;
 
-    if (listen_fd6 == -1 && listen_fd4 == -1) {
-        print_error("Cannot bind to any socket.");
-        return 1;
+    int assigned_port = 0;
+    if (listen_fd6 != -1) {
+        sockaddr_in6 sa6{};
+        socklen_t len = sizeof(sa6);
+        if (getsockname(listen_fd6, (sockaddr*)&sa6, &len) == 0)
+            assigned_port = ntohs(sa6.sin6_port);
+    } else if (listen_fd4 != -1) {
+        sockaddr_in sa4{};
+        socklen_t len = sizeof(sa4);
+        if (getsockname(listen_fd4, (sockaddr*)&sa4, &len) == 0)
+            assigned_port = ntohs(sa4.sin_port);
     }
+    std::cout << "Listening on port: " << assigned_port << std::endl;
+}
 
-    if (port == 0) {
-        int assigned_port = 0;
-        if (listen_fd6 != -1) {
-            sockaddr_in6 sa6{};
-            socklen_t len = sizeof(sa6);
-            if (getsockname(listen_fd6, (sockaddr*)&sa6, &len) == 0)
-                assigned_port = ntohs(sa6.sin6_port);
-        } else if (listen_fd4 != -1) {
-            sockaddr_in sa4{};
-            socklen_t len = sizeof(sa4);
-            if (getsockname(listen_fd4, (sockaddr*)&sa4, &len) == 0)
-                assigned_port = ntohs(sa4.sin_port);
-        }
-        std::cout << "Listening on port: " << assigned_port << std::endl;
-    }
-
+void prepare_sockets(int listen_fd6, int listen_fd4) {
     if (listen_fd6 != -1) {
         int off = 0;
         setsockopt(listen_fd6, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
@@ -289,95 +301,109 @@ int main(int argc, char* argv[]) {
         listen(listen_fd4, SOMAXCONN);
         set_nonblocking(listen_fd4);
     }
+}
 
-    std::vector<pollfd> pollfds;
+void prepare_pollfds(std::vector<pollfd>& pollfds, int listen_fd6, int listen_fd4) {
+    pollfds.clear();
     if (listen_fd6 != -1)
         pollfds.push_back({listen_fd6, POLLIN, 0});
     if (listen_fd4 != -1)
         pollfds.push_back({listen_fd4, POLLIN, 0});
 
-    while (M) {
-        // Add all clients to pollfds
-        pollfds.resize((listen_fd6 != -1) + (listen_fd4 != -1));
-        for (const auto& [fd, info] : clients) {
-            pollfds.push_back({fd, POLLIN, 0});
-        }
+    for (const auto& [fd, info] : clients) {
+        pollfds.push_back({fd, POLLIN, 0});
+    }
+}
 
-        int ret = poll(pollfds.data(), pollfds.size(), -1);
-        if (ret < 0) {
+void accept_new_clients(std::vector<pollfd>& pollfds, int listen_fd6, int listen_fd4) {
+    for (const pollfd& pfd : pollfds) {
+        if ((listen_fd6 != -1 && pfd.fd == listen_fd6 && (pfd.revents & POLLIN)) ||
+            (listen_fd4 != -1 && pfd.fd == listen_fd4 && (pfd.revents & POLLIN))) {
+            sockaddr_storage client_addr{};
+            socklen_t addrlen = sizeof(client_addr);
+            int client_fd = accept(pfd.fd, (sockaddr*)&client_addr, &addrlen);
+            if (client_fd >= 0) {
+                set_nonblocking(client_fd);
+                std::string key = peer_key(client_addr);
+                client_info info;
+                info.socket_fd = client_fd;
+                info.addr = client_addr;
+                info.addr_text = key;
+                info.connect_time = std::chrono::steady_clock::now();
+                clients[client_fd] = info;
+                std::cout << "New client: " << key << std::endl;
+            }
+            }
+    }
+}
+
+void handle_clients(const std::vector<pollfd>& pollfds, int listen_fd6, int listen_fd4) {
+    std::vector<int> to_remove;
+
+    for (size_t i = (listen_fd6 != -1) + (listen_fd4 != -1); i < pollfds.size(); ++i) {
+        const pollfd& pfd = pollfds[i];
+        if (pfd.revents & POLLIN) {
+            char buf[4096];
+            ssize_t recvd = recv(pfd.fd, buf, sizeof(buf), 0);
+            if (recvd <= 0) {
+                close(pfd.fd);
+                std::cout << "Client disconnected: " << clients[pfd.fd].addr_text << std::endl;
+                to_remove.push_back(pfd.fd);
+            } else {
+                clients[pfd.fd].net_buffer.append(buf, recvd);
+                std::cout << "Received " << recvd << " bytes from " << clients[pfd.fd].addr_text << std::endl;
+                process_client_buffer(pfd.fd);
+            }
+        }
+    }
+
+    for (int fd : to_remove) {
+        clients.erase(fd);
+    }
+}
+
+void server_loop(int listen_fd6, int listen_fd4) {
+    std::vector<pollfd> pollfds;
+
+    while (M) {
+        prepare_pollfds(pollfds, listen_fd6, listen_fd4);
+
+        if (poll(pollfds.data(), pollfds.size(), -1) < 0) {
             print_error("poll() error");
             break;
         }
 
-        // Accept new connections
-        for (size_t i = 0; i < pollfds.size(); ++i) {
-            pollfd& pfd = pollfds[i];
-            if ((listen_fd6 != -1 && pfd.fd == listen_fd6 && (pfd.revents & POLLIN)) ||
-                (listen_fd4 != -1 && pfd.fd == listen_fd4 && (pfd.revents & POLLIN))) {
-                sockaddr_storage client_addr{};
-                socklen_t addrlen = sizeof(client_addr);
-                int client_fd = accept(pfd.fd, (sockaddr*)&client_addr, &addrlen);
-                if (client_fd >= 0) {
-                    set_nonblocking(client_fd);
-                    std::string key = peer_key(client_addr);
-                    client_info info;
-                    info.socket_fd = client_fd;
-                    info.addr = client_addr;
-                    info.addr_text = key;
-                    info.connect_time = std::chrono::steady_clock::now();
-                    clients[client_fd] = info;
-                    std::cout << "New client: " << key << std::endl;
-                }
-            }
-        }
+        accept_new_clients(pollfds, listen_fd6, listen_fd4);
+        handle_clients(pollfds, listen_fd6, listen_fd4);
 
-
-        // Handle client data
-        std::vector<int> to_remove;
-        for (size_t i = (listen_fd6 != -1) + (listen_fd4 != -1); i < pollfds.size(); ++i) {
-            pollfd& pfd = pollfds[i];
-            if (pfd.revents & POLLIN) {
-                char buf[4096];
-                ssize_t recvd = recv(pfd.fd, buf, sizeof(buf), 0);
-                if (recvd <= 0) {
-                    close(pfd.fd);
-                    to_remove.push_back(pfd.fd);
-                    std::cout << "Client disconnected: " << clients[pfd.fd].addr_text << std::endl;
-                } else {
-                    clients[pfd.fd].net_buffer.append(buf, recvd);
-                    std::cout << "Received " << recvd << " bytes from " << clients[pfd.fd].addr_text << std::endl;
-                }
-            }
-            std::string& net_buffer = clients[pfd.fd].net_buffer;
-            // Jeśli zaczyna się od "HELLO ".
-            if (net_buffer.size() > 7 && net_buffer.substr(0, 6) == "HELLO ") {
-                size_t pos = net_buffer.find("\r\n");
-                if (pos != std::string::npos) {
-                    // Mamy pełną linię "HELLO <player_id>\r\n"
-                    std::string msg = net_buffer.substr(0, pos); // bez \r\n
-                    if (!handle_hello(pfd.fd, msg)) {
-                        print_error("Invalid HELLO message\n");
-                    }
-                    net_buffer.erase(0, pos + 2); // usuń obsłużoną linię
-                }
-            }
-        }
-        for (int fd : to_remove) {
-            clients.erase(fd);
-        }
-
-        // Clean pollfds
-        pollfds.clear();
-        if (listen_fd6 != -1)
-            pollfds.push_back({listen_fd6, POLLIN, 0});
-        if (listen_fd4 != -1)
-            pollfds.push_back({listen_fd4, POLLIN, 0});
+        pollfds.clear();  // clean pollfds for next loop
     }
+}
 
+
+
+void cleanup(int listen_fd6, int listen_fd4) {
     if (listen_fd6 != -1) close(listen_fd6);
     if (listen_fd4 != -1) close(listen_fd4);
-    for (auto& [fd, info] : clients) {
+
+    for (auto& [fd, _] : clients) {
         close(fd);
     }
+}
+
+int main(int argc, char* argv[]) {
+    if (!initialize(argc, argv)) return 1;
+
+    int listen_fd6 = create_server_socket(AF_INET6);
+    int listen_fd4 = create_server_socket(AF_INET);
+
+    if (listen_fd6 == -1 && listen_fd4 == -1) return 1;
+
+    display_assigned_port(listen_fd6, listen_fd4);
+    prepare_sockets(listen_fd6, listen_fd4);
+
+    server_loop(listen_fd6, listen_fd4);
+
+    cleanup(listen_fd6, listen_fd4);
     return 0;
 }
