@@ -4,6 +4,9 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <vector>
+#include <sstream>
+
 
 std::string player_id, server;
 int port = -1;
@@ -81,6 +84,55 @@ bool parse_arguments(int argc, char *argv[]) {
     return true;
 }
 
+bool handle_coeffs(int sockfd, std::vector<double>& coeffs) {
+    std::string response;
+    char buffer[1024];
+
+    // 1) Czytaj, aż znajdziemy "\r\n"
+    while (true) {
+        ssize_t recvd = recv(sockfd, buffer, sizeof(buffer), 0);
+        if (recvd < 0) {
+            print_error("recv() failed");
+            return false;
+        }
+        if (recvd == 0) {
+            print_error("Server closed connection before sending COEFF");
+            return false;
+        }
+        response.append(buffer, recvd);
+        size_t pos = response.find("\r\n");
+        if (pos != std::string::npos) {
+            // Wyciągamy fragment od początku do pozycji "\r\n" (bez samych CRLF)
+            response = response.substr(0, pos);
+            break;
+        }
+        // w przeciwnym razie kontynuujemy czytanie
+    }
+
+    // 2) Sprawdź format
+    const std::string prefix = "COEFF ";
+    if (response.size() < prefix.size() ||
+        response.compare(0, prefix.size(), prefix) != 0) {
+        print_error("Unexpected response from server: \"" + response + "\"");
+        return false;
+        }
+
+    // 3) Parsuj liczby po słowie "COEFF "
+    std::string numbers_str = response.substr(prefix.size());
+    std::istringstream iss(numbers_str);
+    double x;
+    while (iss >> x) {
+        coeffs.push_back(x);
+    }
+
+    if (coeffs.empty()) {
+        print_error("No coefficients parsed from: \"" + numbers_str + "\"");
+        return false;
+    }
+
+    return true;
+}
+
 int main(int argc, char* argv[]) {
 
     if (!parse_arguments(argc, argv)) {
@@ -129,6 +181,23 @@ int main(int argc, char* argv[]) {
     }
     // wywalic to
     std::cout << "Sent to server: " << hello_msg;
+
+
+    // 2) Odbierz i sparsuj linię COEFF w osobnej funkcji
+    std::vector<double> coeffs;
+    if (!handle_coeffs(sockfd, coeffs)) {
+        // w razie błędu w receive_coeffs zamykamy połączenie
+        close(sockfd);
+        print_error("Invalid COEFF message\n");
+        return 1;
+    }
+
+    // 3) Wyświetl odczytane współczynniki
+    std::cout << "Received COEFF:";
+    for (double c : coeffs) {
+        std::cout << " " << c;
+    }
+    std::cout << "\n";
 
 
     close(sockfd);

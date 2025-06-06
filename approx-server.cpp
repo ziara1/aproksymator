@@ -12,6 +12,8 @@
 #include <poll.h>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
+#include <sstream>
 
 
 #define TIMEOUT 3
@@ -26,12 +28,16 @@ struct client_info {
     sockaddr_storage addr{};
     std::string addr_text{}; // Wersja tekstowa do logów.
     State state{State::AwaitingHello};
-    std::vector<double> coeffs;
-    std::vector<double> approx;
+    std::vector<double> coeffs{};
+    std::vector<double> approx{};
     double penalty{0.0};
     int puts_count{0};
-    std::string net_buffer;
+    std::string net_buffer{};
     int lowercase{0};
+
+    std::string pending_response{};    // treść odpowiedzi, którą musimy wysłać
+    std::chrono::steady_clock::time_point send_time{}; // kiedy wysłać pending_response
+    bool has_pending{false};         // czy jest odpowiedź do wysłania
 };
 
 std::map<int, client_info> clients; // Mapa znanych nam klientów.
@@ -44,6 +50,47 @@ std::string filename{};
 
 static void print_error(const std::string& msg) {
     std::cerr << "ERROR: " << msg << "\n";
+}
+
+static std::ifstream coeff_file;
+
+static bool send_coeff_line(int key) {
+    if (!coeff_file.is_open()) {
+        print_error("Plik z COEFF nie jest otwarty");
+        return false;
+    }
+    std::string line;
+    if (!std::getline(coeff_file, line)) {
+        print_error("Brak kolejnej linii w pliku COEFF");
+        return false;
+    }
+    // Plik ma linie kończące się "\r\n", std::getline usunie '\n',
+    // więc sprawdzamy, czy na końcu został '\r'
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    // Teraz 'line' powinno mieć format "COEFF a0 a1 ... aN"
+    // 1) wyślij klientowi tę linię + "\r\n"
+    std::string to_send = line + "\r\n";
+    int sent = send(clients[key].socket_fd, to_send.c_str(), to_send.size(), 0);
+    if (sent < 0) {
+        print_error("Błąd wysyłania COEFF do klienta " + clients[key].addr_text);
+        return false;
+    }
+    // 2) sparsuj liczby do wektora clients[key].coeffs (pomijając pierwsze słowo "COEFF")
+    std::istringstream iss(line);
+    std::string token;
+    iss >> token; // pobierz "COEFF"
+    double a;
+    // oczekujemy dokładnie N+1 liczb (a0..aN)
+    for (int i = 0; i <= N; i++) {
+        if (!(iss >> a)) {
+            print_error("Nie udało się sparsować współczynnika nr " + std::to_string(i));
+            return false;
+        }
+        clients[key].coeffs.push_back(a);
+    }
+    return true;
 }
 
 // Funkcja do tworzenia kluczy do mapy klientów.
@@ -76,26 +123,32 @@ static bool handle_hello(int key, std::string &msg) {
         clients.erase(key);
         return true;
     }
-    int lowercase = 0;
     std::string player_id{};
     for (int i = 6; i < msg.size(); i++) {
         char c = msg[i];
         if (!(std::isdigit(c) ||
             (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+            print_error("Invalid player_id");
             return false;
         }
-        player_id += c;
-        if (c >= 'a' && c <= 'z') {
-            lowercase++;
-        }
+        clients[key].username += c;
+        if (c >= 'a' && c <= 'z')
+            clients[key].lowercase++;
     }
-
-    clients[key].lowercase = lowercase;
     clients[key].state = State::AwaitingPut;
-    clients[key].username = player_id;
+    // Po udanym HELLO od razu wysyłamy COEFF z pliku:
+    if (!send_coeff_line(key)) {
+        // jeśli coś nie poszło, usuwamy klienta
+        print_error("Invalid COEFF message\n");
+        close(clients[key].socket_fd);
+        clients.erase(key);
+        return false;
+    }
 
     return true;
 }
+
+
 
 static bool parse_arguments(int argc, char *argv[]) {
     bool p = false; bool k = false; bool n = false;
@@ -190,6 +243,12 @@ int create_and_bind_socket(const char* port_str, int family) {
 
 int main(int argc, char* argv[]) {
     if (!parse_arguments(argc, argv)) {
+        return 1;
+    }
+
+    coeff_file.open(filename);
+    if (!coeff_file) {
+        std::cerr << "ERROR: Nie udało się otworzyć pliku: " << filename << "\n";
         return 1;
     }
 
