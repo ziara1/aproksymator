@@ -234,7 +234,7 @@ int main(int argc, char* argv[]) {
         close(sockfd);
         return 1;
     }
-    send_put_command(sockfd, 1, 1.0);
+    send_put_command(sockfd, 1, 4.0);
     std::vector<double> coeffs;
     if (!receive_coeffs(sockfd, coeffs)) {
         close(sockfd);

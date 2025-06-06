@@ -34,6 +34,7 @@ struct client_info {
     int puts_count{0};
     std::string net_buffer{};
     int lowercase{0};
+    int sent_put{};
 
     std::string pending_response{};    // treść odpowiedzi, którą musimy wysłać
     std::chrono::steady_clock::time_point send_time{}; // kiedy wysłać pending_response
@@ -218,13 +219,59 @@ static bool parse_value(const std::string &msg, size_t &i, double &value) {
     return true;
 }
 
+// Pomocnicza funkcja sprawdzająca zakres point i value
+static bool validate_put_range(int key, int point, double value) {
+    if (point < 0 || point > K || value < -5.0 || value > 5.0) {
+        clients[key].penalty += 10;
+        std::ostringstream oss;
+        oss << "BAD_PUT " << point << " " << value << "\r\n";
+        std::string buf = oss.str();
+        int sent = send(clients[key].socket_fd, buf.c_str(), buf.size(), 0);
+        if (sent < 0) {
+            print_error("Błąd wysyłania BAD_PUT " + clients[key].addr_text);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Pomocnicza funkcja sprawdzająca stan klienta
+static bool validate_put_state(int key, int point, double value) {
+    if (clients[key].state != State::AwaitingPut) {
+        clients[key].penalty += 20;
+        std::ostringstream oss;
+        oss << "PENALTY " << point << " " << value << "\r\n";
+        std::string buf = oss.str();
+        int sent = send(clients[key].socket_fd, buf.c_str(), buf.size(), 0);
+        if (sent < 0) {
+            print_error("Błąd wysyłania PENALTY " + clients[key].addr_text);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void update_approximation_and_respond(int key, int point, double value) {
+    // Dodaj wartość do funkcji aproksymującej
+    clients[key].approx[point] += value;
+    auto t = std::chrono::steady_clock::now();
+    clients[key].send_time = t + std::chrono::seconds(clients[key].lowercase);
+
+    // Zbuduj komunikat
+    std::ostringstream oss;
+    oss << "STATE";
+    for (int i = 0; i <= K; ++i) {
+        oss << " " << clients[key].approx[i];
+    }
+    oss << "\r\n";
+    clients[key].has_pending = true;
+    clients[key].pending_response = oss.str();
+}
+
+// Główna funkcja obsługi PUT
 static bool handle_put(int key, std::string &msg) {
     if (clients.find(key) == clients.end()) {
         print_error("Unknown client");
-        return false;
-    }
-    if (clients[key].state != State::AwaitingPut) {
-        print_error("Client in invalid state for PUT");
         return false;
     }
 
@@ -234,14 +281,17 @@ static bool handle_put(int key, std::string &msg) {
 
     if (!parse_point(msg, i, point)) return false;
     if (!parse_value(msg, i, value)) return false;
-
-    if (point < 0 || point > K || value < -5.0 || value > 5.0) {
-        print_error("PUT values out of range");
-        return false;
-    }
+    if (!validate_put_range(key, point, value)) return false;
+    if (!validate_put_state(key, point, value)) return false;
+    if (clients[key].state != State::AwaitingPut ||
+        point < 0 || point > K || value < -5.0 || value > 5.0)
+        return true;
 
     std::cout << "Received PUT: point=" << point << " value=" << value << std::endl;
-    // TODO: implement game logic here
+    M--;
+    clients[key].sent_put++;
+    update_approximation_and_respond(key, value, point);
+
     return true;
 }
 
@@ -431,6 +481,7 @@ void accept_new_clients(std::vector<pollfd>& pollfds, int listen_fd6, int listen
                 set_nonblocking(client_fd);
                 std::string key = peer_key(client_addr);
                 client_info info;
+                info.approx = std::vector<double>(K + 1, 0);
                 info.socket_fd = client_fd;
                 info.addr = client_addr;
                 info.addr_text = key;
@@ -463,7 +514,26 @@ void handle_clients(const std::vector<pollfd>& pollfds, int listen_fd6, int list
     }
 
     for (int fd : to_remove) {
+        M += clients[fd].sent_put;
         clients.erase(fd);
+    }
+}
+
+static void send_pending_responses() {
+    auto now = std::chrono::steady_clock::now();
+    for (auto &kv : clients) {
+        auto &info = kv.second;
+
+        if (info.has_pending && now >= info.send_time) {
+            const std::string &msg = info.pending_response;
+            ssize_t sent = send(info.socket_fd, msg.c_str(), msg.size(), 0);
+            if (sent < 0) {
+                print_error("Błąd wysyłania wiadomości do klienta " + info.addr_text);
+                // Można rozważyć zamknięcie połączenia albo inną obsługę błędu
+            }
+            info.has_pending = false;
+            info.pending_response.clear();
+        }
     }
 }
 
@@ -477,6 +547,7 @@ void server_loop(int listen_fd6, int listen_fd4) {
             print_error("poll() error");
             break;
         }
+        send_pending_responses();
 
         accept_new_clients(pollfds, listen_fd6, listen_fd4);
         handle_clients(pollfds, listen_fd6, listen_fd4);
@@ -495,6 +566,8 @@ void cleanup(int listen_fd6, int listen_fd4) {
         close(fd);
     }
 }
+
+
 
 int main(int argc, char* argv[]) {
     if (!initialize(argc, argv)) return 1;
