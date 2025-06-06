@@ -202,6 +202,29 @@ void print_coeffs(const std::vector<double>& coeffs) {
     std::cout << "\n";
 }
 
+// Zakładamy, że socket_fd to deskryptor już połączonego gniazda TCP
+// point - punkt (0..K), value - wartość (-5..5)
+bool send_put_command(int socket_fd, int point, double value) {
+    // Budujemy komunikat zgodnie z protokołem
+    char buf[128];
+    int len = std::snprintf(buf, sizeof(buf), "PUT %d %.10g\r\n", point, value);
+
+    // Sprawdzamy, czy komunikat się zmieścił
+    if (len <= 0 || len >= (int)sizeof(buf)) {
+        print_error("Failed to format PUT command");
+        return false;
+    }
+
+    // Wysyłamy komunikat do serwera
+    ssize_t sent = send(socket_fd, buf, len, 0);
+    if (sent != len) {
+        print_error("Failed to send PUT command to server");
+        return false;
+    }
+
+    return true;
+}
+
 int main(int argc, char* argv[]) {
     if (!parse_arguments(argc, argv)) return 1;
     int sockfd = connect_to_server();
@@ -211,6 +234,7 @@ int main(int argc, char* argv[]) {
         close(sockfd);
         return 1;
     }
+    send_put_command(sockfd, 1, 1.0);
     std::vector<double> coeffs;
     if (!receive_coeffs(sockfd, coeffs)) {
         close(sockfd);

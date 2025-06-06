@@ -146,7 +146,102 @@ static bool handle_hello(int key, std::string &msg) {
         clients.erase(key);
         return false;
     }
+    return true;
+}
 
+static bool parse_point(const std::string &msg, size_t &i, int &point) {
+    point = 0;
+    int sign = 1;
+    if (i < msg.size() && msg[i] == '-') {
+        sign = -1;
+        i++;
+    }
+
+    bool digit_found = false;
+    while (i < msg.size() && std::isdigit(msg[i])) {
+        digit_found = true;
+        point = point * 10 + (msg[i] - '0');
+        i++;
+    }
+
+    if (!digit_found) {
+        print_error("No digits in point");
+        return false;
+    }
+
+    point *= sign;
+
+    if (i >= msg.size() || msg[i] != ' ') {
+        print_error("No space after point");
+        return false;
+    }
+
+    i++; // Skip space
+    return true;
+}
+
+static bool parse_value(const std::string &msg, size_t &i, double &value) {
+    value = 0.0;
+    int sign = 1;
+    if (i < msg.size() && msg[i] == '-') {
+        sign = -1;
+        i++;
+    }
+
+    bool value_digit_found = false;
+    double frac = 0.1;
+
+    // Integer part
+    while (i < msg.size() && std::isdigit(msg[i])) {
+        value_digit_found = true;
+        value = value * 10.0 + (msg[i] - '0');
+        i++;
+    }
+
+    // Fractional part
+    if (i < msg.size() && msg[i] == '.') {
+        i++;
+        while (i < msg.size() && std::isdigit(msg[i])) {
+            value_digit_found = true;
+            value += frac * (msg[i] - '0');
+            frac *= 0.1;
+            i++;
+        }
+    }
+
+    if (!value_digit_found) {
+        print_error("No digits in value");
+        return false;
+    }
+
+    value *= sign;
+    return true;
+}
+
+static bool handle_put(int key, std::string &msg) {
+    if (clients.find(key) == clients.end()) {
+        print_error("Unknown client");
+        return false;
+    }
+    if (clients[key].state != State::AwaitingPut) {
+        print_error("Client in invalid state for PUT");
+        return false;
+    }
+
+    size_t i = 4;
+    int point = 0;
+    double value = 0.0;
+
+    if (!parse_point(msg, i, point)) return false;
+    if (!parse_value(msg, i, value)) return false;
+
+    if (point < 0 || point > K || value < -5.0 || value > 5.0) {
+        print_error("PUT values out of range");
+        return false;
+    }
+
+    std::cout << "Received PUT: point=" << point << " value=" << value << std::endl;
+    // TODO: implement game logic here
     return true;
 }
 
@@ -248,6 +343,16 @@ void process_client_buffer(int fd) {
             std::string msg = net_buffer.substr(0, pos);
             if (!handle_hello(fd, msg)) {
                 print_error("Invalid HELLO message\n");
+            }
+            net_buffer.erase(0, pos + 2);
+        }
+    }
+    if (net_buffer.size() > 7 && net_buffer.substr(0, 4) == "PUT ") {
+        size_t pos = net_buffer.find("\r\n");
+        if (pos != std::string::npos) {
+            std::string msg = net_buffer.substr(0, pos);
+            if (!handle_put(fd, msg)) {
+                print_error("Invalid PUT message\n");
             }
             net_buffer.erase(0, pos + 2);
         }
