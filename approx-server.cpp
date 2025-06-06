@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 
 
 #define TIMEOUT 3
@@ -48,6 +49,7 @@ int port = 0;
 int K = 100;
 int N = 4;
 int M = 131;
+int currM = 131;
 std::string filename{};
 
 
@@ -288,7 +290,7 @@ static bool handle_put(int key, std::string &msg) {
         return true;
 
     std::cout << "Received PUT: point=" << point << " value=" << value << std::endl;
-    M--;
+    currM--;
     clients[key].sent_put++;
     update_approximation_and_respond(key, value, point);
 
@@ -325,6 +327,7 @@ static bool parse_arguments(int argc, char *argv[]) {
             n = true;
         } else if (arg == "-m" && i + 1 < argc) {
             M = std::atoi(argv[++i]);
+            currM = M;
             if (M < 1 || M > 12341234 || m) {
                 print_error("Invalid value for -m (M)");
                 return false;
@@ -514,7 +517,7 @@ void handle_clients(const std::vector<pollfd>& pollfds, int listen_fd6, int list
     }
 
     for (int fd : to_remove) {
-        M += clients[fd].sent_put;
+        currM += clients[fd].sent_put;
         clients.erase(fd);
     }
 }
@@ -537,10 +540,64 @@ static void send_pending_responses() {
     }
 }
 
+static void end_game_and_reset() {
+    // 1) Oblicz wynik każdego klienta: ∑_{x=0..K} (approx[x] – f(x))^2  + penalty
+    std::vector<std::pair<std::string, double>> results;
+    results.reserve(clients.size());
+
+    for (auto &kv : clients) {
+        auto &info = kv.second;
+
+        double sum_squares = 0.0;
+        for (int x = 0; x <= K; ++x) {
+            // Oblicz f(x) = a[0] + a[1]*x + a[2]*x^2 + … + a[N]*x^N
+            double fx = 0.0;
+            double x_pow = 1.0;
+            for (int i = 0; i <= N; ++i) {
+                fx += kv.second.coeffs[i] * x_pow;
+                x_pow *= static_cast<double>(x);
+            }
+            double diff = info.approx[x] - fx;
+            sum_squares += diff * diff;
+        }
+
+        double total_score = sum_squares + static_cast<double>(info.penalty);
+        results.emplace_back(info.username, total_score);
+    }
+
+    // 2) Posortuj według player_id (rosnąco, ASCII)
+    std::sort(results.begin(), results.end(),
+              [](auto &p1, auto &p2) {
+                  return p1.first < p2.first;
+              });
+
+    // 3) Zbuduj wiadomość "SCORING id1 res1 id2 res2 ...\r\n"
+    std::ostringstream oss;
+    oss << "SCORING";
+    for (auto &pr : results) {
+        oss << " " << pr.first << " " << pr.second;
+    }
+    oss << "\r\n";
+    std::string scoring_msg = oss.str();
+
+    // 4) Wyślij do wszystkich klientów, zamknij gniazda
+    for (auto &kv : clients) {
+        auto &info = kv.second;
+        ssize_t sent = send(info.socket_fd, scoring_msg.c_str(), scoring_msg.size(), 0);
+        if (sent < 0) {
+            print_error("Błąd wysyłania SCORING do klienta " + info.addr_text);
+        }
+        close(info.socket_fd);
+    }
+    clients.clear();
+    sleep(1);
+    currM = M;
+}
+
 void server_loop(int listen_fd6, int listen_fd4) {
     std::vector<pollfd> pollfds;
 
-    while (M) {
+    while (currM) {
         prepare_pollfds(pollfds, listen_fd6, listen_fd4);
 
         if (poll(pollfds.data(), pollfds.size(), -1) < 0) {
@@ -554,6 +611,8 @@ void server_loop(int listen_fd6, int listen_fd4) {
 
         pollfds.clear();  // clean pollfds for next loop
     }
+    end_game_and_reset();
+
 }
 
 
