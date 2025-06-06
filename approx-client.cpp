@@ -1,6 +1,9 @@
 #include <iostream>
 #include <string>
-#include <climits>
+#include <cstring>
+#include <netdb.h>
+#include <unistd.h>
+#include <sys/socket.h>
 
 std::string player_id, server;
 int port = -1;
@@ -84,6 +87,50 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    struct addrinfo hints{}, *res, *rp;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
 
+    if (force4) hints.ai_family = AF_INET;
+    else if (force6) hints.ai_family = AF_INET6;
+    else hints.ai_family = AF_UNSPEC; // pozwala na IPv4 i IPv6
+
+    std::string port_str = std::to_string(port);
+    int err = getaddrinfo(server.c_str(), port_str.c_str(), &hints, &res);
+    if (err != 0) {
+        print_error("getaddrinfo: " + std::string(gai_strerror(err)));
+        return 1;
+    }
+
+    int sockfd = -1;
+    for (rp = res; rp != nullptr; rp = rp->ai_next) {
+        sockfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sockfd == -1)
+            continue;
+        if (connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0)
+            break; // Sukces!
+        close(sockfd);
+        sockfd = -1;
+    }
+    freeaddrinfo(res);
+
+    if (sockfd == -1) {
+        print_error("Could not connect to server");
+        return 1;
+    }
+
+    // --- Wyślij wiadomość HELLO ---
+    std::string hello_msg = "HELLO " + player_id + "\r\n";
+    ssize_t sent = send(sockfd, hello_msg.c_str(), hello_msg.size(), 0);
+    if (sent < 0) {
+        print_error("Failed to send HELLO message");
+        close(sockfd);
+        return 1;
+    }
+    // wywalic to
+    std::cout << "Sent to server: " << hello_msg;
+
+
+    close(sockfd);
     return 0;
 }
