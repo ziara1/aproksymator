@@ -36,10 +36,11 @@ struct client_info {
     std::string net_buffer{};
     int lowercase{0};
     int sent_put{};
-
-    std::string pending_response{};    // treść odpowiedzi, którą musimy wysłać
-    std::chrono::steady_clock::time_point send_time{}; // kiedy wysłać pending_response
-    bool has_pending{false};         // czy jest odpowiedź do wysłania
+    // treść odpowiedzi, którą musimy wysłać
+    std::string pending_response{};
+    // kiedy wysłać pending_response
+    std::chrono::steady_clock::time_point send_time{};
+    bool has_pending{false}; // czy jest odpowiedź do wysłania
     client_info() = default;
 
 };
@@ -54,7 +55,7 @@ std::string filename{};
 
 
 static void print_error(const std::string& msg) {
-    std::cerr << "ERROR: " << msg << "\n";
+    std::cerr << "ERROR: " << msg << std::endl;
 }
 
 static std::ifstream coeff_file;
@@ -76,13 +77,13 @@ static bool send_coeff_line(int key) {
     }
     // Teraz 'line' powinno mieć format "COEFF a0 a1 ... aN"
     // 1) wyślij klientowi tę linię + "\r\n"
-    std::string to_send = line + "\r\n";
-    int sent = send(clients[key].socket_fd, to_send.c_str(), to_send.size(), 0);
+    std::string msg = line + "\r\n";
+    int sent = send(clients[key].socket_fd, msg.c_str(), msg.size(), 0);
     if (sent < 0) {
-        print_error("Błąd wysyłania COEFF do klienta " + clients[key].addr_text);
+        print_error("Błąd wysyłania COEFF " + clients[key].addr_text);
         return false;
     }
-    // 2) sparsuj liczby do wektora clients[key].coeffs (pomijając pierwsze słowo "COEFF")
+    // Sparsowanie liczby do wektora clients[key].coeffs pomijając "COEFF"
     std::istringstream iss(line);
     std::string token;
     iss >> token; // pobierz "COEFF"
@@ -90,7 +91,7 @@ static bool send_coeff_line(int key) {
     // oczekujemy dokładnie N+1 liczb (a0..aN)
     for (int i = 0; i <= N; i++) {
         if (!(iss >> a)) {
-            print_error("Nie udało się sparsować współczynnika nr " + std::to_string(i));
+            print_error("Błąd parsowania współczynnika " + std::to_string(i));
             return false;
         }
         clients[key].coeffs.push_back(a);
@@ -128,8 +129,7 @@ static bool handle_hello(int key, std::string &msg) {
         clients.erase(key);
         return true;
     }
-    std::string player_id{};
-    for (int i = 6; i < msg.size(); i++) {
+    for (unsigned int i = 6; i < msg.size(); i++) {
         char c = msg[i];
         if (!(std::isdigit(c) ||
             (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
@@ -141,6 +141,8 @@ static bool handle_hello(int key, std::string &msg) {
             clients[key].lowercase++;
     }
     clients[key].state = State::AwaitingPut;
+    std::cout << clients[key].addr_text <<
+        " is now known as " << clients[key].username << ".\n";
     // Po udanym HELLO od razu wysyłamy COEFF z pliku:
     if (!send_coeff_line(key)) {
         // jeśli coś nie poszło, usuwamy klienta
@@ -149,6 +151,11 @@ static bool handle_hello(int key, std::string &msg) {
         clients.erase(key);
         return false;
     }
+    std::cout << clients[key].username << " get coefficients";
+    for (int i = 0; i <= N; ++i) {
+        std::cout << " " << clients[key].coeffs[i];
+    }
+    std::cout << ".\n";
     return true;
 }
 
@@ -253,9 +260,17 @@ static bool validate_put_state(int key, int point, double value) {
     return true;
 }
 
-static void update_approximation_and_respond(int key, int point, double value) {
+static void update_approximation_and_respond(int key, int point, double val) {
     // Dodaj wartość do funkcji aproksymującej
-    clients[key].approx[point] += value;
+    clients[key].approx[point] += val;
+    std::cout << clients[key].username
+          << " puts " << val
+          << " in " << point
+          << ", current state";
+    for (int x = 0; x <= K; ++x) {
+        std::cout << " " << clients[key].approx[x];
+    }
+    std::cout << ".\n";
     auto t = std::chrono::steady_clock::now();
     clients[key].send_time = t + std::chrono::seconds(clients[key].lowercase);
 
@@ -289,7 +304,8 @@ static bool handle_put(int key, std::string &msg) {
         point < 0 || point > K || value < -5.0 || value > 5.0)
         return true;
 
-    std::cout << "Received PUT: point=" << point << " value=" << value << std::endl;
+    std::cout << "Received PUT: point="
+    << point << " value=" << value << std::endl;
     currM--;
     clients[key].sent_put++;
     update_approximation_and_respond(key, value, point);
@@ -417,7 +433,7 @@ bool initialize(int argc, char* argv[]) {
 
     coeff_file.open(filename);
     if (!coeff_file) {
-        std::cerr << "ERROR: Nie udało się otworzyć pliku: " << filename << "\n";
+        print_error("Nie udało się otworzyć pliku: " + filename);
         return false;
     }
 
@@ -461,7 +477,8 @@ void prepare_sockets(int listen_fd6, int listen_fd4) {
     }
 }
 
-void prepare_pollfds(std::vector<pollfd>& pollfds, int listen_fd6, int listen_fd4) {
+void prepare_pollfds(std::vector<pollfd>& pollfds,
+    int listen_fd6, int listen_fd4) {
     pollfds.clear();
     if (listen_fd6 != -1)
         pollfds.push_back({listen_fd6, POLLIN, 0});
@@ -473,16 +490,19 @@ void prepare_pollfds(std::vector<pollfd>& pollfds, int listen_fd6, int listen_fd
     }
 }
 
-void accept_new_clients(std::vector<pollfd>& pollfds, int listen_fd6, int listen_fd4) {
+void accept_new_clients(std::vector<pollfd>& pollfds,
+    int listen_fd6, int listen_fd4) {
     for (const pollfd& pfd : pollfds) {
-        if ((listen_fd6 != -1 && pfd.fd == listen_fd6 && (pfd.revents & POLLIN)) ||
-            (listen_fd4 != -1 && pfd.fd == listen_fd4 && (pfd.revents & POLLIN))) {
+        if ((listen_fd6 != -1 && pfd.fd == listen_fd6 &&
+            (pfd.revents & POLLIN)) || (listen_fd4 != -1 &&
+                pfd.fd == listen_fd4 && (pfd.revents & POLLIN))) {
             sockaddr_storage client_addr{};
             socklen_t addrlen = sizeof(client_addr);
             int client_fd = accept(pfd.fd, (sockaddr*)&client_addr, &addrlen);
             if (client_fd >= 0) {
                 set_nonblocking(client_fd);
                 std::string key = peer_key(client_addr);
+                std::cout << "New client [" << key << "].\n";
                 client_info info;
                 info.approx = std::vector<double>(K + 1, 0);
                 info.socket_fd = client_fd;
@@ -496,21 +516,23 @@ void accept_new_clients(std::vector<pollfd>& pollfds, int listen_fd6, int listen
     }
 }
 
-void handle_clients(const std::vector<pollfd>& pollfds, int listen_fd6, int listen_fd4) {
+void handle_clients(const std::vector<pollfd>& pollfds,
+    int listen_fd6, int listen_fd4) {
     std::vector<int> to_remove;
 
-    for (size_t i = (listen_fd6 != -1) + (listen_fd4 != -1); i < pollfds.size(); ++i) {
+    for (size_t i = (listen_fd6 != -1) +
+        (listen_fd4 != -1); i < pollfds.size(); ++i) {
         const pollfd& pfd = pollfds[i];
         if (pfd.revents & POLLIN) {
             char buf[4096];
             ssize_t recvd = recv(pfd.fd, buf, sizeof(buf), 0);
             if (recvd <= 0) {
                 close(pfd.fd);
-                std::cout << "Client disconnected: " << clients[pfd.fd].addr_text << std::endl;
+                std::cout << "Client disconnected: "
+                << clients[pfd.fd].addr_text << std::endl;
                 to_remove.push_back(pfd.fd);
             } else {
                 clients[pfd.fd].net_buffer.append(buf, recvd);
-                std::cout << "Received " << recvd << " bytes from " << clients[pfd.fd].addr_text << std::endl;
                 process_client_buffer(pfd.fd);
             }
         }
@@ -528,11 +550,15 @@ static void send_pending_responses() {
         auto &info = kv.second;
 
         if (info.has_pending && now >= info.send_time) {
+            std::cout << "Sending state";
+            for (int x = 0; x <= K; ++x) {
+                std::cout << " " << info.approx[x];
+            }
+            std::cout << " to " << info.username << ".\n";
             const std::string &msg = info.pending_response;
             ssize_t sent = send(info.socket_fd, msg.c_str(), msg.size(), 0);
             if (sent < 0) {
-                print_error("Błąd wysyłania wiadomości do klienta " + info.addr_text);
-                // Można rozważyć zamknięcie połączenia albo inną obsługę błędu
+                print_error("Błąd wysyłania wiadomości " + info.addr_text);
             }
             info.has_pending = false;
             info.pending_response.clear();
@@ -541,7 +567,7 @@ static void send_pending_responses() {
 }
 
 static void end_game_and_reset() {
-    // 1) Oblicz wynik każdego klienta: ∑_{x=0..K} (approx[x] – f(x))^2  + penalty
+    // Wynik każdego klienta: ∑_{x=0..K} (approx[x] – f(x))^2  + penalty
     std::vector<std::pair<std::string, double>> results;
     results.reserve(clients.size());
 
@@ -570,8 +596,11 @@ static void end_game_and_reset() {
               [](auto &p1, auto &p2) {
                   return p1.first < p2.first;
               });
-
-    // 3) Zbuduj wiadomość "SCORING id1 res1 id2 res2 ...\r\n"
+    std::cout << "Game end, scoring:";
+    for (auto &pr : results) {
+        std::cout << " " << pr.first << " " << pr.second;
+    }
+    std::cout << ".\n";
     std::ostringstream oss;
     oss << "SCORING";
     for (auto &pr : results) {
@@ -583,7 +612,8 @@ static void end_game_and_reset() {
     // 4) Wyślij do wszystkich klientów, zamknij gniazda
     for (auto &kv : clients) {
         auto &info = kv.second;
-        ssize_t sent = send(info.socket_fd, scoring_msg.c_str(), scoring_msg.size(), 0);
+        ssize_t sent = send(info.socket_fd,
+            scoring_msg.c_str(), scoring_msg.size(), 0);
         if (sent < 0) {
             print_error("Błąd wysyłania SCORING do klienta " + info.addr_text);
         }
@@ -639,7 +669,9 @@ int main(int argc, char* argv[]) {
     display_assigned_port(listen_fd6, listen_fd4);
     prepare_sockets(listen_fd6, listen_fd4);
 
-    server_loop(listen_fd6, listen_fd4);
+    do {
+        server_loop(listen_fd6, listen_fd4);
+    } while (true);
 
     cleanup(listen_fd6, listen_fd4);
     return 0;
